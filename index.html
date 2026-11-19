@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Job Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="lock" class="lock" hidden>
+  <form id="lockForm" class="lock-box" autocomplete="on">
+    <h2>Job Dashboard</h2>
+    <p class="muted">Enter your passphrase to unlock.</p>
+    <input type="text" name="username" value="job-dashboard" autocomplete="username" hidden>
+    <input id="pass" type="password" autocomplete="current-password" placeholder="Passphrase" required>
+    <label class="check"><input type="checkbox" id="remember" checked> Remember on this device</label>
+    <button id="unlockBtn" class="btn" type="submit">Unlock</button>
+    <p id="lockErr" class="lock-err" role="alert"></p>
+  </form>
+</div>
+<header class="top">
+  <div class="top-row">
+    <h1>Job Dashboard</h1>
+    <div class="refresh">
+      <span id="updated" class="muted">Loading…</span>
+      <button id="refreshBtn" class="btn ghost small" title="Load the latest data now">Refresh</button>
+      <button id="lockBtn" class="btn ghost small" title="Lock and forget the passphrase on this device" hidden>Lock</button>
+    </div>
+  </div>
+  <div id="banner" class="banner" hidden></div>
+  <div class="stats" id="stats">
+    <div class="stat"><span class="stat-num" id="statMatches">—</span><span class="stat-label">matches</span></div>
+    <div class="stat"><span class="stat-num" id="statNew">—</span><span class="stat-label">new since last visit</span></div>
+    <div class="stat"><span class="stat-num" id="statSeen">—</span><span class="stat-label">listings seen</span></div>
+    <div class="stat"><span class="stat-num" id="statLast">—</span><span class="stat-label">last match</span></div>
+    <div class="stat"><span class="stat-num" id="statRun">—</span><span class="stat-label">last cron run</span></div>
+    <div class="stat"><span class="stat-num"><span class="badge score-badge" id="statMin">—</span></span><span class="stat-label">min score</span></div>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="jobs">Jobs</button>
+    <button class="tab" role="tab" data-tab="health">Search health</button>
+    <button class="tab" role="tab" data-tab="runs">Runs</button>
+    <button class="tab" role="tab" data-tab="about">About</button>
+  </nav>
+</header>
+
+<main>
+  <!-- JOBS -->
+  <section id="tab-jobs" class="panel" hidden>
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search title, company, reason…  ( / )" autocomplete="off">
+      <label class="slider">
+        <span>Min score <b id="minScoreVal">50</b></span>
+        <input id="minScore" type="range" min="0" max="100" step="1" value="50">
+      </label>
+      <select id="company"><option value="">All companies</option></select>
+      <select id="location"><option value="">All locations</option></select>
+      <select id="source">
+        <option value="">All sources</option>
+        <option value="employer">Employer-direct</option>
+        <option value="linkedin">LinkedIn</option>
+        <option value="aggregator">Aggregator</option>
+      </select>
+      <select id="sort">
+        <option value="date">Newest first</option>
+        <option value="score">Highest score</option>
+      </select>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="list-meta">
+      <span id="listCount" class="muted"></span>
+      <span class="muted">Rejected jobs are hidden unless you pick “Rejected”.</span>
+      <button id="markSeen" class="btn ghost small" title="Clear the NEW markers">Mark all as seen</button>
+    </div>
+    <div id="jobList" class="job-list"></div>
+  </section>
+
+  <!-- SEARCH HEALTH -->
+  <section id="tab-health" class="panel" hidden>
+    <p class="intro">How each search query has performed across cron runs. <b>Stale</b> = zero results on the last 2+ runs it was used (candidates to retire). <b>Top 10</b> = best average results per run.</p>
+    <div class="controls">
+      <input id="hq" type="search" placeholder="Filter queries…" autocomplete="off">
+      <label class="check"><input type="checkbox" id="staleOnly"> Stale only</label>
+      <span id="healthSummary" class="muted"></span>
+    </div>
+    <div class="table-wrap"><table id="healthTable" class="data"></table></div>
+  </section>
+
+  <!-- RUNS -->
+  <section id="tab-runs" class="panel" hidden>
+    <p class="intro">One row per cron run, parsed from <code>job_results.txt</code>. Click a row to see the original line.</p>
+    <div class="table-wrap"><table id="runsTable" class="data"></table></div>
+    <div id="unparsed"></div>
+  </section>
+
+  <!-- ABOUT -->
+  <section id="tab-about" class="panel" hidden>
+    <div class="about-grid" id="about"></div>
+  </section>
+</main>
+
+<template id="jobTpl">
+  <article class="card">
+    <div class="card-head">
+      <div class="card-title">
+        <h3 class="title"></h3>
+        <div class="sub"><span class="company"></span><span class="dot">·</span><span class="location"></span></div>
+      </div>
+      <span class="score"></span>
+    </div>
+    <div class="tags"></div>
+    <p class="reason"></p>
+    <div class="note-wrap" hidden><textarea class="note" rows="2" placeholder="Private note (saved automatically)"></textarea></div>
+    <div class="card-foot">
+      <div class="status-btns">
+        <button class="sbtn" data-s="interested">Interested</button>
+        <button class="sbtn" data-s="applied">Applied</button>
+        <button class="sbtn" data-s="rejected">Reject</button>
+        <button class="sbtn note-btn" title="Add a private note">Note</button>
+      </div>
+      <a class="apply" target="_blank" rel="noopener noreferrer">Apply →</a>
+    </div>
+  </article>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>
