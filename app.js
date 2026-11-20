@@ -114,6 +114,9 @@
     }).then(function (b) { return new Uint8Array(b); });
   }
   function decrypt(blob, raw) {
+    return decryptRaw(blob, raw).then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); });
+  }
+  function decryptRaw(blob, raw) {
     var iv = unb64(blob.iv), ct = unb64(blob.ct), mac = unb64(blob.mac);
     var signed = new Uint8Array(iv.length + ct.length); signed.set(iv); signed.set(ct, iv.length);
     return crypto.subtle.importKey("raw", raw.slice(32, 64), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]).then(function (k) {
@@ -124,8 +127,27 @@
     }).then(function (k) {
       return crypto.subtle.decrypt({ name: "AES-CTR", counter: iv, length: 64 }, k, ct);
     }).then(function (buf) {
-      return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("deflate"))).text();
-    }).then(JSON.parse);
+      return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer();
+    });
+  }
+  // Tailored CVs are published encrypted with the same passphrase: fetch, unlock here, save.
+  function downloadCv(d, btn) {
+    var key = savedKey(); if (!key) return showLock("");
+    var label = btn.textContent; btn.textContent = "Unlocking…"; btn.disabled = true;
+    fetchJson(d.path).then(function (blob) { return decryptRaw(blob, fromHex(key.hex)); }).then(function (buf) {
+      var type = /\.pdf$/i.test(d.name) ? "application/pdf" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      var url = URL.createObjectURL(new Blob([buf], { type: type }));
+      var a = el("a", { href: url, download: d.name }); document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+    }).catch(function (e) { alert("Couldn't download the CV: " + (e.message || e)); })
+      .then(function () { btn.textContent = label; btn.disabled = false; });
+  }
+  function cvButtons(j, quiet) {
+    var dl = (j.cv && j.cv.dl) || {}, out = [];
+    [["pdf", "CV (PDF)"], ["docx", "CV (Word)"]].forEach(function (x) {
+      if (dl[x[0]]) out.push(el("button", { class: "btn" + (quiet ? " quiet" : ""), on: { click: function (e) { downloadCv(dl[x[0]], e.currentTarget); } } }, "⬇ " + x[1]));
+    });
+    return out;
   }
   function savedKey() {
     var k = null;
@@ -317,11 +339,9 @@
     d.appendChild(facts);
 
     var acts = el("div", { class: "actions" });
+    if (j.cv) d.appendChild(cvBlock(j));
     var link = safeUrl(j.apply_url) || safeUrl(j.url);
     if (link) acts.appendChild(el("a", { class: "btn primary", href: link, target: "_blank", rel: "noopener noreferrer", text: "Open posting ↗" }));
-    if (j.cv && j.cv.docx) acts.appendChild(el("a", { class: "btn", href: repoFile(j.cv.docx, true), target: "_blank", rel: "noopener", text: "Download CV (Word)" }));
-    if (j.cv && j.cv.pdf) acts.appendChild(el("a", { class: "btn", href: repoFile(j.cv.pdf, false), target: "_blank", rel: "noopener", text: "View CV (PDF)" }));
-    if (j.cv && j.cv.notes) acts.appendChild(el("a", { class: "btn quiet", href: repoFile(j.cv.notes, false), target: "_blank", rel: "noopener", text: "What changed" }));
     var tu = tailorUrl(j);
     if (tu && !j.legacy) acts.appendChild(el("a", { class: "btn", href: tu, target: "_blank", rel: "noopener", text: j.cv ? "Re-tailor CV" : "Tailor my CV" }));
     d.appendChild(acts);
@@ -332,8 +352,29 @@
       acts2.appendChild(el("button", { class: "btn" + (on ? " on-" + x[0] : ""), on: { click: function () { setStatus(j, on ? null : x[0]); } } }, x[1]));
     });
     d.appendChild(acts2);
-    if (tu && !j.legacy && !j.cv) d.appendChild(el("p", { class: "hint", text: "“Tailor my CV” opens a pre-filled GitHub issue. Press Submit and a tailored CV appears on this job in about 3 minutes." }));
+    if (tu && !j.legacy && !j.cv) d.appendChild(el("p", { class: "hint", text: "Jobs scoring 75+ get a tailored CV automatically each morning. For this one, “Tailor my CV” opens a pre-filled GitHub page: press Submit and the CV appears here in about 3–5 minutes." }));
     return d;
+  }
+
+  function cvBlock(j) {
+    var cv = j.cv, box = el("div", { class: "cvbox" });
+    box.appendChild(el("h4", { text: "Tailored CV" + (cv.date ? " · " + cv.date : "") + (cv.auto ? " · made automatically" : "") }));
+    var row = el("div", { class: "actions" }, cvButtons(j, false));
+    box.appendChild(row);
+    if (cv.cover) {
+      var copy = el("button", { class: "btn quiet", on: { click: function (e) {
+        var b = e.currentTarget;
+        (navigator.clipboard ? navigator.clipboard.writeText(cv.cover) : Promise.reject()).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500); })
+          .catch(function () { b.textContent = "Select and copy the text above"; });
+      } } }, "Copy");
+      box.appendChild(el("details", null, el("summary", { text: "Cover note draft" }),
+        el("p", { class: "cover", text: cv.cover }), copy));
+    }
+    if (cv.missing && cv.missing.length) box.appendChild(el("details", null, el("summary", { text: "Be ready to answer (" + cv.missing.length + ")" }), list("gap", cv.missing)));
+    if (cv.changes && cv.changes.length) box.appendChild(el("details", null, el("summary", { text: "What the AI changed" }), list("ok", cv.changes),
+      cv.reverted ? el("p", { class: "hint", text: cv.reverted + " line(s) failed the fact check and were put back to your baseline wording." }) : null));
+    box.appendChild(el("p", { class: "hint", text: "Always read it before sending." }));
+    return box;
   }
 
   function renderApps() {
@@ -375,7 +416,7 @@
         sel),
       el("div", { class: "actions" },
         link ? el("a", { class: "btn quiet", href: link, target: "_blank", rel: "noopener noreferrer", text: "Posting ↗" }) : null,
-        j.cv && j.cv.pdf ? el("a", { class: "btn quiet", href: repoFile(j.cv.pdf, false), target: "_blank", rel: "noopener", text: "CV sent" }) : null),
+        cvButtons(j, true)),
       note);
   }
 
