@@ -151,3 +151,8 @@ body.locked .top, body.locked main { display: none; }
   .bar #status { font-size: 11px; }
   .btn { padding: 9px 11px; }
 }
+
+.cvbox { background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.cvbox details { font-size: 13.5px; }
+.cvbox details > *:not(summary) { margin-top: 6px; }
+.cover { white-space: pre-wrap; color: var(--soft); font-size: 13.5px; margin: 6px 0; }
