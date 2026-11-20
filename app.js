@@ -332,7 +332,7 @@
     function fact(k, v) { if (v) { facts.appendChild(el("dt", { text: k })); facts.appendChild(el("dd", { text: v })); } }
     fact("Role", [j.seat, j.seniority].filter(Boolean).join(" · "));
     fact("Salary", j.salary);
-    fact("Source", ({ greenhouse: "Employer site", lever: "Employer site", ashby: "Employer site", mcf: "MyCareersFuture", linkedin: "LinkedIn", hermes: "Old Hermes search" })[j.source] || j.source);
+    fact("Source", ({ greenhouse: "Employer site", lever: "Employer site", ashby: "Employer site", mcf: "MyCareersFuture", linkedin: "LinkedIn", telegram: "Telegram (Talent@Web3)", hermes: "Old Hermes search" })[j.source] || j.source);
     fact("Posted", j.posted ? j.posted + " (" + ago(j.posted) + ")" : "");
     fact("Found", j.found);
     if (j.open === false) fact("Status", "Closed" + (j.closed_on ? " (noticed " + j.closed_on + ")" : ""));
@@ -428,14 +428,14 @@
       var col = run.collected || {}, fl = run.filtered || {};
       box.appendChild(el("div", { class: "box" }, el("h2", { text: "Last run · " + fmtTime(run.finished || run.started) }),
         el("div", { class: "kpis" },
-          kpi((col.boards || 0) + (col.mcf || 0) + (col.linkedin || 0), "postings checked"),
+          kpi((col.boards || 0) + (col.mcf || 0) + (col.linkedin || 0) + (col.telegram || 0), "postings checked"),
           kpi((run.triage || {}).in, "new to judge"),
           kpi(run.scored, "read in full by AI"),
           kpi(run.matches, "new matches"),
           kpi(run.closed, "postings closed")),
         el("p", { class: "muted small", style: "margin-top:10px", text:
           "Sources: " + (col.boards || 0) + " from " + (run.boards_ok || 0) + "/" + (run.boards_total || 0) + " employer boards, " +
-          (col.mcf || 0) + " MyCareersFuture, " + (col.linkedin || 0) + " LinkedIn. Filtered out by rules: " + (fl.title || 0) + " by title, " +
+          (col.mcf || 0) + " MyCareersFuture, " + (col.linkedin || 0) + " LinkedIn, " + (col.telegram || 0) + " Telegram. Filtered out by rules: " + (fl.title || 0) + " by title, " +
           (fl.location || 0) + " by location." + (run.deferred ? " " + run.deferred + " left for the next run (daily AI budget)." : "") }),
         run.errors && run.errors.length ? el("p", { class: "err", text: run.errors.join("; ") }) : null));
     }
@@ -456,7 +456,7 @@
         var tag = q.matches ? el("span", { class: "pill good", text: "useful" })
           : q.zero_streak >= 3 ? el("span", { class: "pill stale", text: "stale" })
           : q.runs >= 10 ? el("span", { class: "pill quiet", text: "no matches yet" }) : null;
-        tb.appendChild(el("tr", null, el("td", { class: "wrap", text: q.query }), el("td", { text: q.source === "mcf" ? "MyCareersFuture" : "LinkedIn" }),
+        tb.appendChild(el("tr", null, el("td", { class: "wrap", text: q.query }), el("td", { text: ({ mcf: "MyCareersFuture", linkedin: "LinkedIn", telegram: "Telegram" })[q.source] || q.source }),
           el("td", { class: "num", text: q.avg_results }), el("td", { class: "num", text: q.matches }), el("td", null, tag)));
       });
       t.appendChild(tb);
@@ -480,7 +480,7 @@
         el("details", null, el("summary", { text: "Show boards" }), el("div", { class: "tbl-wrap" }, t2))));
     }
     box.appendChild(el("div", { class: "box" }, el("h2", { text: "How this works" }),
-      el("p", { text: "Every morning a job on GitHub checks " + boards.length + " employer job boards, MyCareersFuture and LinkedIn. Simple rules drop obvious mismatches (engineering, marketing, wrong country). An AI then reads each remaining job and scores it against your CAREER_FACTS file and preferences. " + (P.min_score || 60) + "+ shows up for review." }),
+      el("p", { text: "Every morning a job on GitHub checks " + boards.length + " employer job boards, MyCareersFuture, LinkedIn and the Talent@Web3 Telegram channel. Simple rules drop obvious mismatches (engineering, marketing, wrong country). An AI then reads each remaining job and scores it against your CAREER_FACTS file and preferences. " + (P.min_score || 60) + "+ shows up for review." }),
       el("p", { text: "The data is encrypted with your passphrase before it is published. Your shortlist, applications and notes stay in this browser on this device." })));
   }
   function kpi(v, label) { return el("div", { class: "kpi" }, el("b", { text: v == null ? "–" : String(v) }), el("span", { text: label })); }
