@@ -1,768 +1,479 @@
-/* Job Dashboard - vanilla JS, no libraries, no network calls except to this local server. */
+/* Job Hunt dashboard. Decrypts data.json with your passphrase (Web Crypto); no libraries, no trackers.
+   Your Shortlist / Applied / notes are saved in this browser (localStorage). */
 (function () {
   "use strict";
 
-  var POLL_MS = 5 * 60 * 1000; // check for new cron output every 5 minutes
-  var STALE_HOURS = 36;        // warn if the data files haven't changed for this long
+  var POLL_MS = 5 * 60 * 1000;
+  var STALE_HOURS = 36;
+  var FOLLOW_UP_DAYS = 7;
+  var STAGES = [["applied", "Applied"], ["interview", "Interviewing"], ["offer", "Offer"], ["rejected", "Rejected"], ["withdrawn", "Withdrawn"]];
+  var APP_STAGES = { applied: 1, interview: 1, offer: 1, rejected: 1, withdrawn: 1 };
 
-  var D = { jobs: null, queries: null, runs: null, status: null, site: {} };
-  var ui = {
-    tab: "jobs", q: "", minScore: null, company: "", location: "", source: "", sort: "date", chip: "all",
-    hq: "", staleOnly: false, hSort: { key: "avg_results", dir: -1 }
-  };
-  var lastSignature = null;
-  var errors = {};
+  var P = null;            // decrypted payload
+  var S = loadSite();      // per-device state
+  var version = null;
+  var ui = { tab: recall("tab", "review"), view: recall("view", "todo"), q: "", open: {}, fOpen: true, fNear: false, fOld: false, fSkipped: false };
 
-  // ---------- helpers ----------
+  // ---------- tiny helpers ----------
   function $(id) { return document.getElementById(id); }
   function el(tag, attrs) {
     var e = document.createElement(tag);
-    if (attrs) for (var k in attrs) {
-      if (attrs[k] == null) continue;
-      if (k === "text") e.textContent = attrs[k];
-      else if (k === "class") e.className = attrs[k];
-      else e.setAttribute(k, attrs[k]);
+    for (var k in attrs || {}) {
+      var v = attrs[k];
+      if (v == null || v === false) continue;
+      if (k === "text") e.textContent = v;
+      else if (k === "class") e.className = v;
+      else if (k === "on") for (var ev in v) e.addEventListener(ev, v[ev]);
+      else e.setAttribute(k, v === true ? "" : v);
     }
     for (var i = 2; i < arguments.length; i++) {
       var c = arguments[i];
-      if (c == null) continue;
-      e.appendChild(typeof c === "string" || typeof c === "number" ? document.createTextNode(String(c)) : c);
+      if (c == null || c === false) continue;
+      if (Array.isArray(c)) c.forEach(function (x) { if (x) e.appendChild(typeof x === "string" ? document.createTextNode(x) : x); });
+      else e.appendChild(typeof c === "string" || typeof c === "number" ? document.createTextNode(String(c)) : c);
     }
     return e;
   }
-  function dash(v) { return v === null || v === undefined || v === "" ? "—" : String(v); }
-  function fmtNum(n) { return typeof n === "number" ? n.toLocaleString() : "—"; }
-  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  function fmtDate(d) {
-    if (!d || !/^\d{4}-\d{2}-\d{2}/.test(d)) return "—";
-    var y = +d.slice(0, 4), m = +d.slice(5, 7), day = +d.slice(8, 10);
-    var s = day + " " + MONTHS[m - 1];
-    return y === new Date().getFullYear() ? s : s + " " + y;
-  }
-  function todayStr() {
-    var t = new Date();
-    return t.getFullYear() + "-" + String(t.getMonth() + 1).padStart(2, "0") + "-" + String(t.getDate()).padStart(2, "0");
-  }
-  function daysAgo(d) {
+  function store(k, v) { try { localStorage.setItem("jobhunt." + k, JSON.stringify(v)); } catch (e) {} }
+  function recall(k, d) { try { var v = localStorage.getItem("jobhunt." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } }
+  function todayStr() { var t = new Date(); return t.getFullYear() + "-" + String(t.getMonth() + 1).padStart(2, "0") + "-" + String(t.getDate()).padStart(2, "0"); }
+  function daysSince(d) {
     if (!d) return null;
-    var a = new Date(d.slice(0, 10) + "T00:00:00"), b = new Date(todayStr() + "T00:00:00");
-    return Math.round((b - a) / 86400000);
+    var a = new Date(String(d).slice(0, 10) + "T00:00:00"), b = new Date(todayStr() + "T00:00:00");
+    var n = Math.round((b - a) / 864e5); return isNaN(n) ? null : n;
   }
-  function relDay(d) {
-    var n = daysAgo(d);
-    if (n === null || isNaN(n)) return "—";
-    if (n <= 0) return "today";
-    if (n === 1) return "yesterday";
-    return n + "d ago";
+  function ago(d) {
+    var n = daysSince(d);
+    if (n === null) return "";
+    return n <= 0 ? "today" : n === 1 ? "yesterday" : n < 30 ? n + "d ago" : Math.round(n / 30) + "mo ago";
   }
   function fmtTime(iso) {
-    if (!iso) return "—";
-    var t = new Date(iso);
-    if (isNaN(t)) return iso;
+    var t = new Date(iso); if (isNaN(t)) return "";
     return t.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
   }
-  function store(k, v) { try { localStorage.setItem("jobdash." + k, JSON.stringify(v)); } catch (e) {} }
-  function recall(k, dflt) {
-    try { var v = localStorage.getItem("jobdash." + k); return v === null ? dflt : JSON.parse(v); } catch (e) { return dflt; }
+  function safeUrl(u) { return /^https?:\/\//i.test(u || "") ? u : null; }
+  function scoreClass(s) { return s >= 75 ? "s-hi" : s >= 60 ? "s-mid" : "s-lo"; }
+
+  // ---------- per-device state ----------
+  function loadSite() { var s = recall("site", {}); s.st = s.st || {}; return s; }
+  function saveSite() { store("site", S); }
+  function stOf(j) { return (S.st[j.id] || {}).s || ""; }
+  function setStatus(j, s) {
+    var e = S.st[j.id] || { at: {} };
+    e.at = e.at || {};
+    if (s && e.s !== s) e.at[s] = todayStr();
+    if (s) e.s = s; else delete e.s;
+    e.t = j.title; e.c = j.company;
+    if (e.s || e.note) S.st[j.id] = e; else delete S.st[j.id];
+    saveSite(); renderAll();
+  }
+  function setNote(j, note) {
+    var e = S.st[j.id] || { at: {} };
+    if (note) e.note = note; else delete e.note;
+    if (e.s || e.note) S.st[j.id] = e; else delete S.st[j.id];
+    saveSite();
+  }
+  function recordVisit() {
+    var now = Date.now(), last = S.lastVisit || 0;
+    if (!S.prevVisitDay || now - last > 30 * 60 * 1000) S.prevVisitDay = last ? new Date(last).toISOString().slice(0, 10) : null;
+    S.lastVisit = now; saveSite();
+  }
+  function isNew(j) {
+    if (j.legacy || !j.found) return false;
+    return S.prevVisitDay ? j.found > S.prevVisitDay : daysSince(j.found) <= 1;
+  }
+  // Carry over Interested/Applied/Reject from the previous version of this site (keyed by URL).
+  function migrateOldStatuses() {
+    if (S.migrated || !P) return;
+    var old = null;
+    try { old = JSON.parse(localStorage.getItem("jobdash.site") || "null"); } catch (e) {}
+    var map = { interested: "shortlist", applied: "applied", rejected: "skip" };
+    if (old && old.statuses) {
+      var byUrl = {}; P.jobs.forEach(function (j) { byUrl[j.url] = j; });
+      Object.keys(old.statuses).forEach(function (url) {
+        var o = old.statuses[url], j = byUrl[url];
+        if (!j || S.st[j.id]) return;
+        var e = { at: {}, t: j.title, c: j.company };
+        if (map[o.status]) { e.s = map[o.status]; e.at[e.s] = (o[o.status + "_at"] || "").slice(0, 10) || todayStr(); }
+        if (o.note) e.note = o.note;
+        if (e.s || e.note) S.st[j.id] = e;
+      });
+    }
+    S.migrated = true; saveSite();
   }
 
-  function api(path, body) {
-    var opts = body === undefined ? { cache: "no-store" } :
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-    return fetch(path, opts).then(function (r) {
-      return r.json().catch(function () { return { error: "bad response (" + r.status + ")" }; }).then(function (j) {
-        if (!r.ok && j && !j.error) j.error = "HTTP " + r.status;
-        return j;
-      });
-    });
-  }
-
-  // ---------- data sources ----------
-  // LOCAL: page served by server.py on this computer -> live JSON API, statuses saved in site_state.json.
-  // HOSTED: page on the internet (GitHub Pages) -> encrypted data.json, statuses saved in this browser.
-  var HOSTED = /[?&]hosted(=|&|$)/.test(location.search) ||
-    !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
-  var VISIT_GAP_MS = 30 * 60 * 1000;
-
-  function isoNow() { return new Date().toISOString().replace(/\.\d+Z$/, "Z"); }
-  function mergeStatuses(statuses, updates) {
-    var now = isoNow();
-    Object.keys(updates).forEach(function (key) {
-      var val = updates[key];
-      if (val === null) { delete statuses[key]; return; }
-      var e = Object.assign({}, statuses[key] || {});
-      if ("status" in val) {
-        if (val.status) { if (e.status !== val.status) e[val.status + "_at"] = now; e.status = val.status; }
-        else delete e.status;
-      }
-      if ("note" in val) { if (val.note) e.note = val.note; else delete e.note; }
-      if (val.title) e.title = val.title;
-      if (val.company) e.company = val.company;
-      e.updated_at = now;
-      if (e.status || e.note) statuses[key] = e; else delete statuses[key];
-    });
-    return statuses;
-  }
-
-  var Local = {
-    offline: "Can't reach the dashboard server. Start it again with “Start Job Dashboard.bat”.",
-    load: function (recordVisit) {
-      var visit = recordVisit ? api("/api/visit", {}).catch(function () { return null; }) : Promise.resolve(null);
-      return visit.then(function (site) {
-        return Promise.all([
-          api("/api/jobs"), api("/api/queries"), api("/api/runs"), api("/api/status"),
-          site ? Promise.resolve(site) : api("/api/state")
-        ]);
-      }).then(function (res) { res.version = res[3] && res[3].signature; return res; });
-    },
-    changed: function () {
-      return api("/api/status").then(function (st) {
-        if (st && st.signature && st.signature !== lastSignature) return true;
-        if (st && !st.error) D.status = st;
-        return false;
-      });
-    },
-    save: function (updates) {
-      return api("/api/state", { statuses: updates }).then(function (res) {
-        if (res.error) throw new Error(res.error);
-        return res.statuses || {};
-      });
-    },
-    visit: function (markSeen) { return api("/api/visit", markSeen ? { mark_seen: true } : {}); }
-  };
-
-  // --- hosted mode: decrypt data.json with the passphrase (Web Crypto, no libraries) ---
+  // ---------- crypto ----------
   function lockError(msg) { var e = new Error(msg); e.locked = true; return e; }
-  function unb64(s) { var bin = atob(s), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; }
+  function unb64(s) { var b = atob(s), a = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; }
   function toHex(a) { return Array.prototype.map.call(a, function (x) { return ("0" + x.toString(16)).slice(-2); }).join(""); }
   function fromHex(h) { var a = new Uint8Array(h.length / 2); for (var i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16); return a; }
-  function deriveKeys(pass, saltB64, iter) {
-    var subtle = window.crypto && crypto.subtle;
-    if (!subtle) return Promise.reject(new Error("This browser can't decrypt (needs an https:// page)."));
-    return subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveBits"]).then(function (k) {
-      return subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: unb64(saltB64), iterations: iter }, k, 512);
-    }).then(function (bits) { return new Uint8Array(bits); });
+  function deriveKeys(pass, salt, iter) {
+    if (!(window.crypto && crypto.subtle)) return Promise.reject(new Error("This browser can't decrypt (needs an https:// page)."));
+    return crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveBits"]).then(function (k) {
+      return crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: unb64(salt), iterations: iter }, k, 512);
+    }).then(function (b) { return new Uint8Array(b); });
   }
-  function decryptBlob(blob, raw) {
-    var subtle = crypto.subtle, iv = unb64(blob.iv), ct = unb64(blob.ct), mac = unb64(blob.mac);
+  function decrypt(blob, raw) {
+    var iv = unb64(blob.iv), ct = unb64(blob.ct), mac = unb64(blob.mac);
     var signed = new Uint8Array(iv.length + ct.length); signed.set(iv); signed.set(ct, iv.length);
-    return subtle.importKey("raw", raw.slice(32, 64), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]).then(function (k) {
-      return subtle.verify("HMAC", k, mac, signed);
+    return crypto.subtle.importKey("raw", raw.slice(32, 64), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]).then(function (k) {
+      return crypto.subtle.verify("HMAC", k, mac, signed);
     }).then(function (ok) {
       if (!ok) throw lockError("Wrong passphrase.");
-      return subtle.importKey("raw", raw.slice(0, 32), "AES-CTR", false, ["decrypt"]);
+      return crypto.subtle.importKey("raw", raw.slice(0, 32), "AES-CTR", false, ["decrypt"]);
     }).then(function (k) {
-      return subtle.decrypt({ name: "AES-CTR", counter: iv, length: 64 }, k, ct);
+      return crypto.subtle.decrypt({ name: "AES-CTR", counter: iv, length: 64 }, k, ct);
     }).then(function (buf) {
       return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("deflate"))).text();
     }).then(JSON.parse);
   }
   function savedKey() {
     var k = null;
-    try { k = JSON.parse(sessionStorage.getItem("jobdash.key") || "null"); } catch (e) {}
+    try { k = JSON.parse(sessionStorage.getItem("jobhunt.key") || "null"); } catch (e) {}
     return k || recall("key", null);
   }
-  function forgetKey() {
-    try { sessionStorage.removeItem("jobdash.key"); localStorage.removeItem("jobdash.key"); } catch (e) {}
-  }
+  function forgetKey() { try { sessionStorage.removeItem("jobhunt.key"); localStorage.removeItem("jobhunt.key"); } catch (e) {} }
   function fetchJson(name) {
     return fetch(name + "?t=" + Date.now(), { cache: "no-store" }).then(function (r) {
-      if (!r.ok) throw new Error(name + " not found (" + r.status + ") — has the publisher run yet?");
+      if (!r.ok) throw new Error("Couldn't load " + name + " (" + r.status + ").");
       return r.json();
     });
   }
-
-  var Hosted = {
-    offline: "Couldn't load the latest data — check your internet connection.",
-    unlock: function (pass, remember) {
-      return fetchJson("data.json").then(function (blob) {
-        return deriveKeys(pass, blob.salt, blob.iter).then(function (raw) {
-          return decryptBlob(blob, raw).then(function () {
-            var k = { salt: blob.salt, hex: toHex(raw) };
-            forgetKey();
-            if (remember) store("key", k);
-            else try { sessionStorage.setItem("jobdash.key", JSON.stringify(k)); } catch (e) {}
-          });
+  function unlock(pass, remember) {
+    return fetchJson("data.json").then(function (blob) {
+      return deriveKeys(pass, blob.salt, blob.iter).then(function (raw) {
+        return decrypt(blob, raw).then(function () {
+          var k = { salt: blob.salt, hex: toHex(raw) };
+          forgetKey();
+          if (remember) store("key", k); else try { sessionStorage.setItem("jobhunt.key", JSON.stringify(k)); } catch (e) {}
         });
       });
-    },
-    load: function (recordVisit) {
-      var key = savedKey();
-      if (!key) return Promise.reject(lockError(""));
-      return fetchJson("data.json").then(function (blob) {
-        if (blob.salt !== key.salt) { forgetKey(); throw lockError("The passphrase was changed — enter the new one."); }
-        return decryptBlob(blob, fromHex(key.hex)).catch(function (e) {
-          if (e.locked) forgetKey();
-          throw e;
-        }).then(function (p) {
-          var jobsList = (p.jobs && p.jobs.jobs) || [];
-          var site = recordVisit ? Hosted.visitWith(jobsList, false) : Hosted.site();
-          var res = [p.jobs, p.queries, p.runs, p.status, site];
-          res.version = blob.iv; res.published_at = p.published_at;
-          return res;
-        });
-      });
-    },
-    changed: function () {
-      return fetchJson("version.json").then(function (v) { return v.version !== lastSignature; });
-    },
-    site: function () { var s = recall("site", {}); s.statuses = s.statuses || {}; return s; },
-    save: function (updates) {
-      var s = Hosted.site();
-      mergeStatuses(s.statuses, updates);
-      store("site", s);
-      return Promise.resolve(s.statuses);
-    },
-    visitWith: function (jobsList, markSeen) {
-      var s = Hosted.site(), now = isoNow();
-      var fs = s.first_seen || {}, boot = !Object.keys(fs).length;
-      jobsList.forEach(function (j) {
-        if (!fs[j.key]) fs[j.key] = boot ? (j.date ? j.date + "T12:00:00Z" : "2000-01-01T00:00:00Z") : now;
-      });
-      s.first_seen = fs;
-      var last = s.last_visit ? Date.parse(s.last_visit) : null;
-      if (markSeen) s.prev_visit = now;
-      else if (boot && !("prev_visit" in s)) {
-        var latest = jobsList.reduce(function (m, j) { return j.date > m ? j.date : m; }, "");
-        s.prev_visit = latest ? latest + "T00:00:00Z" : null;
-      } else if (!last || Date.now() - last > VISIT_GAP_MS) s.prev_visit = s.last_visit || null;
-      s.last_visit = now;
-      store("site", s);
-      return s;
-    },
-    visit: function (markSeen) { return Promise.resolve(Hosted.visitWith(jobs(), markSeen)); }
-  };
+    });
+  }
+  function load() {
+    var key = savedKey();
+    if (!key) return Promise.reject(lockError(""));
+    return fetchJson("data.json").then(function (blob) {
+      if (blob.salt !== key.salt) { forgetKey(); throw lockError("The passphrase changed. Enter the new one."); }
+      return decrypt(blob, fromHex(key.hex)).catch(function (e) { if (e.locked) forgetKey(); throw e; })
+        .then(function (p) { version = blob.iv; return p; });
+    });
+  }
 
-  var Src = HOSTED ? Hosted : Local;
-
-  // ---------- data loading ----------
-  function loadAll(recordVisit) {
-    return Src.load(recordVisit).then(function (res) {
-      // Keep the previous good data if a file is mid-write / temporarily broken.
-      setPart("jobs", res[0], function (x) { return Array.isArray(x.jobs) && x.jobs.length; });
-      setPart("queries", res[1], function (x) { return Array.isArray(x.queries) && x.queries.length; });
-      setPart("runs", res[2], function (x) { return Array.isArray(x.runs) && x.runs.length; });
-      setPart("status", res[3], function (x) { return x.files; });
-      if (res[4] && !res[4].error) D.site = res[4];
-      lastSignature = res.version;
-      D.publishedAt = res.published_at || null;
-      delete errors.server;
-      showApp();
-      $("updated").textContent = HOSTED && D.publishedAt ? "Published " + fmtTime(D.publishedAt)
-        : "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  // ---------- loading & polling ----------
+  var loadError = null;
+  function refresh(first) {
+    return load().then(function (p) {
+      P = p; loadError = null;
+      if (first) recordVisit();
+      migrateOldStatuses();
+      document.body.classList.remove("locked"); $("lock").hidden = true;
       renderAll();
     }).catch(function (e) {
       if (e && e.locked) return showLock(e.message);
-      errors.server = HOSTED && e && e.message ? e.message : Src.offline;
-      $("updated").textContent = "Offline";
-      showApp();
-      renderBanner();
+      loadError = e.message || "Couldn't load the latest data.";
+      document.body.classList.remove("locked"); $("lock").hidden = true;
+      renderAll();
     });
   }
-
+  function poll() {
+    if (document.hidden || !P) return;
+    fetchJson("version.json").then(function (v) { if (v.version !== version) refresh(false); }).catch(function () {});
+  }
   function showLock(msg) {
-    document.body.classList.add("locked");
-    $("lock").hidden = false;
-    $("lockErr").textContent = msg || "";
-    $("pass").value = "";
+    document.body.classList.add("locked"); $("lock").hidden = false;
+    $("lockErr").textContent = msg || ""; $("pass").value = "";
     setTimeout(function () { $("pass").focus(); }, 50);
   }
-  function showApp() {
-    document.body.classList.remove("locked");
-    $("lock").hidden = true;
-  }
-  function setPart(name, val, hasData) {
-    if (!val) return;
-    if (val.error) errors[name] = val.error; else delete errors[name];
-    if (!val.error || !D[name] || hasData(val)) D[name] = val;
-  }
 
-  function poll() {
-    if (document.hidden || document.body.classList.contains("locked")) return;
-    Src.changed().then(function (changed) {
-      delete errors.server;
-      if (changed) return loadAll(true);
-      renderBanner(); renderHeader();
-      if (!HOSTED) $("updated").textContent = "Checked " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    }).catch(function () {
-      errors.server = Src.offline;
-      renderBanner();
-    });
+  // ---------- selections ----------
+  function jobs() { return (P && P.jobs) || []; }
+  function isMatch(j) { return !j.legacy && (j.score || 0) >= (P.min_score || 60); }
+  function todo() {
+    return jobs().filter(function (j) { return isMatch(j) && j.open !== false && !stOf(j); })
+      .sort(function (a, b) { return (b.score - a.score) || ((b.found || "") > (a.found || "") ? 1 : -1); });
   }
-
-  // ---------- job helpers ----------
-  function jobs() { return (D.jobs && D.jobs.jobs) || []; }
-  function statusOf(j) { var s = (D.site.statuses || {})[j.key]; return (s && s.status) || ""; }
-  function noteOf(j) { var s = (D.site.statuses || {})[j.key]; return (s && s.note) || ""; }
-  function isNew(j) {
-    var fs = (D.site.first_seen || {})[j.key];
-    var prev = D.site.prev_visit;
-    if (!fs) return true; // appeared since the last visit was recorded
-    return !!prev && fs > prev;
-  }
-  function scoreClass(s) { return typeof s !== "number" ? "na" : s >= 70 ? "hi" : "mid"; }
-  var SOURCE_LABEL = { employer: "employer-direct", linkedin: "LinkedIn", aggregator: "aggregator", unknown: "no link" };
-
-  function filteredJobs() {
+  function shortlist() { return jobs().filter(function (j) { return stOf(j) === "shortlist"; }).sort(byScore); }
+  function apps() { return jobs().filter(function (j) { return APP_STAGES[stOf(j)]; }); }
+  function byScore(a, b) { return ((b.score || b.legacy_score || 0) - (a.score || a.legacy_score || 0)); }
+  function allJobs() {
     var terms = ui.q.toLowerCase().split(/\s+/).filter(Boolean);
-    var min = ui.minScore == null ? 0 : ui.minScore;
     return jobs().filter(function (j) {
-      if (typeof j.score === "number" && j.score < min) return false;
-      if (ui.company && j.company !== ui.company) return false;
-      if (ui.location && j.location !== ui.location) return false;
-      if (ui.source && j.source !== ui.source) return false;
+      var s = stOf(j);
+      if (j.legacy && !ui.fOld) return false;
+      if (!j.legacy && !isMatch(j) && !ui.fNear) return false;
+      if (ui.fOpen && j.open === false) return false;
+      if (s === "skip" && !ui.fSkipped) return false;
       if (terms.length) {
-        var hay = (j.title + " " + j.company + " " + j.reason + " " + j.location).toLowerCase();
+        var hay = [j.title, j.company, j.location, j.summary, j.seat].join(" ").toLowerCase();
         for (var i = 0; i < terms.length; i++) if (hay.indexOf(terms[i]) < 0) return false;
       }
       return true;
-    });
-  }
-  function chipMatch(j, chip) {
-    var s = statusOf(j);
-    if (chip === "rejected") return s === "rejected";
-    if (s === "rejected") return false;
-    if (chip === "all") return true;
-    if (chip === "new") return isNew(j);
-    return s === chip;
+    }).sort(function (a, b) { return ((b.found || "") > (a.found || "") ? 1 : (b.found || "") < (a.found || "") ? -1 : byScore(a, b)); });
   }
 
   // ---------- rendering ----------
   function renderAll() {
-    // Don't wipe a note you're in the middle of typing; try again shortly.
-    var ae = document.activeElement;
-    if (ae && ae.classList && ae.classList.contains("note")) { setTimeout(renderAll, 3000); return; }
-    renderHeader(); renderBanner(); fillDropdowns(); renderJobs(); renderHealth(); renderRuns(); renderAbout();
+    if (!P && !loadError) return;
+    renderHeader(); renderReview(); renderApps(); renderInsights(); showTab(ui.tab);
   }
 
-  function lastRunDate() {
-    var r = D.runs && D.runs.runs && D.runs.runs[0];
-    var q = D.queries && D.queries.latest_date;
-    var best = r ? r.date : null;
-    if (q && (!best || q > best)) best = q;
-    return best;
-  }
+  function lastRun() { var r = (P && P.runs) || []; return r.length ? r[r.length - 1] : null; }
 
   function renderHeader() {
-    var J = D.jobs || {};
-    $("statMatches").textContent = fmtNum(J.unique_count != null ? J.unique_count : jobs().length);
-    $("statNew").textContent = fmtNum(jobs().filter(function (j) { return isNew(j) && statusOf(j) !== "rejected"; }).length);
-    $("statSeen").textContent = fmtNum(J.seen_count);
-    $("statLast").textContent = J.last_match_date ? relDay(J.last_match_date) : "—";
-    $("statLast").title = J.last_match_date || "";
-    var lr = lastRunDate();
-    $("statRun").textContent = lr ? relDay(lr) : "—";
-    $("statRun").title = lr || "";
-    $("statMin").textContent = dash(J.min_score);
-  }
-
-  function renderBanner() {
-    var b = $("banner"), msgs = [], isErr = false;
-    if (errors.server) { msgs.push(errors.server); isErr = true; }
-    ["jobs", "queries", "runs", "status"].forEach(function (k) { if (errors[k]) { msgs.push(errors[k]); isErr = true; } });
-    var st = D.status;
-    if (st && st.data_dir_exists === false) {
-      msgs.push("Data folder not found: " + st.data_dir + " — check the path in server.py or start with --data-dir.");
-      isErr = true;
-    } else if (st && st.newest_file_update) {
-      var hrs = (Date.now() - new Date(st.newest_file_update).getTime()) / 3600000;
-      if (hrs > STALE_HOURS) msgs.push("No data file has changed for " + Math.round(hrs / 24 * 10) / 10 +
-        " days (last update " + fmtTime(st.newest_file_update) + "). Is the Hermes cron job still running?");
+    var nNew = P ? todo().filter(isNew).length : 0;
+    var parts = [];
+    if (P) parts.push("Updated " + fmtTime(P.generated));
+    if (nNew) parts.push(nNew + " new");
+    $("status").textContent = parts.join(" · ");
+    $("cReview").textContent = P ? (todo().length || "") : "";
+    $("cApps").textContent = P ? (apps().length || "") : "";
+    var msgs = [], err = false, run = lastRun();
+    if (loadError) { msgs.push(loadError); err = true; }
+    if (P) {
+      var hrs = (Date.now() - new Date(P.generated).getTime()) / 36e5;
+      if (hrs > STALE_HOURS) msgs.push("No update for " + Math.round(hrs) + " hours. The daily run may have failed; check the Actions tab of the job-hunter repository.");
+      if (run && run.errors && run.errors.length) { msgs.push("Last run had problems: " + run.errors.join("; ")); }
     }
-    if (!msgs.length) { b.hidden = true; return; }
-    b.hidden = false;
-    b.className = "banner" + (isErr ? " error" : "");
-    b.textContent = msgs.join("  •  ");
+    var b = $("banner");
+    b.hidden = !msgs.length; b.className = "banner" + (err ? " error" : ""); b.textContent = msgs.join("  •  ");
   }
 
-  function fillSelect(sel, values, allLabel) {
-    var cur = sel.value;
-    while (sel.options.length > 1) sel.remove(1);
-    sel.options[0].textContent = allLabel;
-    values.forEach(function (v) { sel.appendChild(el("option", { value: v[0], text: v[0] + " (" + v[1] + ")" })); });
-    sel.value = values.some(function (v) { return v[0] === cur; }) ? cur : "";
-  }
-  function counts(field) {
-    var m = {};
-    jobs().forEach(function (j) { if (j[field]) m[j[field]] = (m[j[field]] || 0) + 1; });
-    return Object.keys(m).map(function (k) { return [k, m[k]]; })
-      .sort(function (a, b) { return b[1] - a[1] || a[0].localeCompare(b[0]); });
-  }
-  function fillDropdowns() {
-    fillSelect($("company"), counts("company"), "All companies");
-    fillSelect($("location"), counts("location"), "All locations");
-    ui.company = $("company").value; ui.location = $("location").value;
-    if (ui.minScore == null && D.jobs) {
-      ui.minScore = typeof D.jobs.min_score === "number" ? D.jobs.min_score : 50;
-      $("minScore").value = ui.minScore; $("minScoreVal").textContent = ui.minScore;
-    }
-  }
-
-  var CHIPS = [["all", "All"], ["new", "New"], ["interested", "Interested"], ["applied", "Applied"], ["rejected", "Rejected"]];
-
-  function renderJobs() {
-    var base = filteredJobs();
-    var chips = $("chips");
-    chips.textContent = "";
-    CHIPS.forEach(function (c) {
-      var n = base.filter(function (j) { return chipMatch(j, c[0]); }).length;
-      var b = el("button", { class: "chip" + (ui.chip === c[0] ? " active" : ""), "data-chip": c[0] }, c[1], el("span", { class: "n", text: n }));
-      b.addEventListener("click", function () { ui.chip = c[0]; store("chip", ui.chip); renderJobs(); });
-      chips.appendChild(b);
+  function renderReview() {
+    if (!P) return;
+    var views = { todo: todo(), shortlist: shortlist(), all: allJobs() };
+    document.querySelectorAll(".seg button").forEach(function (b) {
+      var v = b.getAttribute("data-view");
+      b.classList.toggle("active", v === ui.view);
+      var n = b.querySelector(".n"); if (!n) { n = el("span", { class: "n" }); b.appendChild(n); }
+      n.textContent = v === "all" ? "" : views[v].length;
     });
-
-    var list = base.filter(function (j) { return chipMatch(j, ui.chip); });
-    if (ui.sort === "score") {
-      list.sort(function (a, b) { return (b.score || 0) - (a.score || 0) || (b.date > a.date ? 1 : b.date < a.date ? -1 : 0); });
-    }
-    $("listCount").textContent = "Showing " + list.length + " of " + jobs().length;
-    $("markSeen").hidden = !jobs().some(isNew);
-
-    var box = $("jobList");
-    box.textContent = "";
+    $("allTools").hidden = ui.view !== "all";
+    var list = views[ui.view] || [];
+    $("listHint").textContent = ui.view === "todo" && list.length
+      ? "Best matches first. Tap a job for details. Anything you shortlist, apply to, or mark “Not for me” leaves this list."
+      : ui.view === "all" ? list.length + " jobs" : "";
+    var box = $("list"); box.textContent = "";
     if (!list.length) {
-      var msg = !D.jobs ? "Loading…" : !jobs().length ? (D.jobs.error ? "No job data: " + D.jobs.error : "No matches yet. They'll appear here after the cron job reports one.")
-        : "No jobs match these filters.";
-      box.appendChild(el("div", { class: "empty", text: msg }));
+      box.appendChild(ui.view === "todo"
+        ? el("div", { class: "empty" }, el("b", { text: "You're all caught up." }), "New matches appear here after each daily run (around 9am).")
+        : ui.view === "shortlist"
+          ? el("div", { class: "empty" }, el("b", { text: "No shortlisted jobs yet." }), "Tap a job, then Shortlist, to keep it here.")
+          : el("div", { class: "empty", text: "No jobs match these filters." }));
       return;
     }
     var frag = document.createDocumentFragment();
-    var tpl = $("jobTpl").content;
-    list.forEach(function (j) { frag.appendChild(renderCard(j, tpl)); });
+    list.slice(0, 300).forEach(function (j) { frag.appendChild(card(j)); });
     box.appendChild(frag);
   }
 
-  function renderCard(j, tpl) {
-    var node = tpl.firstElementChild.cloneNode(true);
-    var s = statusOf(j), fresh = isNew(j);
-    if (s === "rejected") node.classList.add("is-rejected");
-    if (fresh && s !== "rejected") node.classList.add("is-new");
-    node.querySelector(".title").textContent = dash(j.title);
-    node.querySelector(".company").textContent = dash(j.company);
-    node.querySelector(".location").textContent = dash(j.location);
-    var sc = node.querySelector(".score");
-    sc.textContent = typeof j.score === "number" ? j.score : "—";
-    sc.className = "score " + scoreClass(j.score);
-    sc.title = "Match score";
+  function card(j) {
+    var s = stOf(j), score = j.legacy ? j.legacy_score : j.score, open = !!ui.open[j.id];
+    var tags = el("span", { class: "tags" },
+      isNew(j) && !s ? el("span", { class: "tag new", text: "new" }) : null,
+      j.cv ? el("span", { class: "tag cv", text: "CV ready" }) : null,
+      j.open === false ? el("span", { class: "tag closed", text: "closed" }) : null,
+      s && s !== "skip" && ui.view !== "shortlist" ? el("span", { class: "tag st", text: s === "shortlist" ? "shortlisted" : s }) : null,
+      j.legacy ? el("span", { class: "tag", text: "old" }) : null);
+    var metaBits = [j.company, j.location, ago(j.posted || j.found)].filter(Boolean).join(" · ");
+    var main = el("button", { class: "card-main", "aria-expanded": open ? "true" : "false", on: { click: function () { ui.open[j.id] = !ui.open[j.id]; renderReview(); } } },
+      el("span", { class: "score " + (j.legacy ? "s-lo" : scoreClass(score || 0)), title: j.legacy ? "Old keyword score from Hermes" : "Match score" }, score == null ? "–" : String(score)),
+      el("span", { class: "cm" },
+        el("h3", null, j.title || "Untitled", tags),
+        el("div", { class: "meta", text: metaBits }),
+        j.summary ? el("p", { class: "sum", text: j.summary }) : null));
+    var c = el("article", { class: "card" + (j.open === false ? " closed" : "") }, main);
+    if (open) c.appendChild(detail(j));
+    return c;
+  }
 
-    var tags = node.querySelector(".tags");
-    if (fresh && s !== "rejected") tags.appendChild(el("span", { class: "badge new", text: "NEW" }));
-    if (s) tags.appendChild(el("span", { class: "badge " + s, text: s === "rejected" ? "rejected" : s }));
-    tags.appendChild(el("span", { class: "badge", title: j.date ? "Reported " + j.date : "", text: fmtDate(j.date) }));
-    tags.appendChild(el("span", { class: "badge " + j.source, title: j.host || "", text: SOURCE_LABEL[j.source] || j.source }));
-    if (j.blocked_domain) tags.appendChild(el("span", { class: "badge blocked", text: "blocked domain" }));
-    if (j.times_reported > 1) tags.appendChild(el("span", { class: "badge", title: "First reported " + (j.first_reported || "?"), text: "reported ×" + j.times_reported }));
+  function list(cls, items) {
+    return items && items.length ? el("ul", { class: cls }, items.map(function (t) { return el("li", { text: t }); })) : null;
+  }
 
-    var r = node.querySelector(".reason");
-    r.textContent = j.reason || "—";
-    if (j.description) r.title = j.description;
-    r.addEventListener("click", function () { r.classList.toggle("open"); });
+  function tailorUrl(j) {
+    if (!P.repo) return null;
+    var title = "Tailor CV: " + j.title + " @ " + j.company;
+    var body = "Job ID: " + j.id + "\nPosting: " + j.url + "\n\nSubmit this issue to generate a tailored CV (takes about 3 minutes).\n" +
+      "Optional: write anything the AI should emphasise below this line.\n---\n";
+    return "https://github.com/" + P.repo + "/issues/new?title=" + encodeURIComponent(title) + "&body=" + encodeURIComponent(body);
+  }
+  function repoFile(path, raw) { return "https://github.com/" + P.repo + (raw ? "/raw/main/" : "/blob/main/") + path.split("/").map(encodeURIComponent).join("/"); }
 
-    var a = node.querySelector(".apply");
-    if (j.url) a.href = j.url; else { a.classList.add("disabled"); a.textContent = "No link"; }
+  function detail(j) {
+    var s = stOf(j);
+    var d = el("div", { class: "detail" });
+    if (j.strengths && j.strengths.length) d.appendChild(el("div", null, el("h4", { text: "Why it fits" }), list("ok", j.strengths)));
+    if (j.gaps && j.gaps.length) d.appendChild(el("div", null, el("h4", { text: "Gaps" }), list("gap", j.gaps)));
+    if (j.dealbreakers && j.dealbreakers.length) d.appendChild(el("div", null, el("h4", { text: "Dealbreakers" }), list("bad", j.dealbreakers)));
+    var facts = el("dl", { class: "facts" });
+    function fact(k, v) { if (v) { facts.appendChild(el("dt", { text: k })); facts.appendChild(el("dd", { text: v })); } }
+    fact("Role", [j.seat, j.seniority].filter(Boolean).join(" · "));
+    fact("Salary", j.salary);
+    fact("Source", ({ greenhouse: "Employer site", lever: "Employer site", ashby: "Employer site", mcf: "MyCareersFuture", linkedin: "LinkedIn", hermes: "Old Hermes search" })[j.source] || j.source);
+    fact("Posted", j.posted ? j.posted + " (" + ago(j.posted) + ")" : "");
+    fact("Found", j.found);
+    if (j.open === false) fact("Status", "Closed" + (j.closed_on ? " (noticed " + j.closed_on + ")" : ""));
+    d.appendChild(facts);
 
-    node.querySelectorAll(".sbtn[data-s]").forEach(function (b) {
-      if (b.getAttribute("data-s") === s) b.classList.add("on");
-      b.addEventListener("click", function () {
-        var want = b.getAttribute("data-s");
-        setStatus(j, want === statusOf(j) ? null : want);
+    var acts = el("div", { class: "actions" });
+    var link = safeUrl(j.apply_url) || safeUrl(j.url);
+    if (link) acts.appendChild(el("a", { class: "btn primary", href: link, target: "_blank", rel: "noopener noreferrer", text: "Open posting ↗" }));
+    if (j.cv && j.cv.docx) acts.appendChild(el("a", { class: "btn", href: repoFile(j.cv.docx, true), target: "_blank", rel: "noopener", text: "Download CV (Word)" }));
+    if (j.cv && j.cv.pdf) acts.appendChild(el("a", { class: "btn", href: repoFile(j.cv.pdf, false), target: "_blank", rel: "noopener", text: "View CV (PDF)" }));
+    if (j.cv && j.cv.notes) acts.appendChild(el("a", { class: "btn quiet", href: repoFile(j.cv.notes, false), target: "_blank", rel: "noopener", text: "What changed" }));
+    var tu = tailorUrl(j);
+    if (tu && !j.legacy) acts.appendChild(el("a", { class: "btn", href: tu, target: "_blank", rel: "noopener", text: j.cv ? "Re-tailor CV" : "Tailor my CV" }));
+    d.appendChild(acts);
+
+    var acts2 = el("div", { class: "actions" });
+    [["shortlist", "Shortlist"], ["applied", "Applied"], ["skip", "Not for me"]].forEach(function (x) {
+      var on = s === x[0] || (x[0] === "applied" && APP_STAGES[s]);
+      acts2.appendChild(el("button", { class: "btn" + (on ? " on-" + x[0] : ""), on: { click: function () { setStatus(j, on ? null : x[0]); } } }, x[1]));
+    });
+    d.appendChild(acts2);
+    if (tu && !j.legacy && !j.cv) d.appendChild(el("p", { class: "hint", text: "“Tailor my CV” opens a pre-filled GitHub issue. Press Submit and a tailored CV appears on this job in about 3 minutes." }));
+    return d;
+  }
+
+  function renderApps() {
+    if (!P) return;
+    var box = $("apps"); box.textContent = "";
+    var items = apps();
+    if (!items.length) {
+      box.appendChild(el("div", { class: "empty" }, el("b", { text: "No applications tracked yet." }), "Open a job and tap Applied. It will show up here with reminders to follow up."));
+      return;
+    }
+    STAGES.forEach(function (st) {
+      var group = items.filter(function (j) { return stOf(j) === st[0]; });
+      if (!group.length) return;
+      group.sort(function (a, b) { return ((S.st[b.id].at || {}).applied || "") > ((S.st[a.id].at || {}).applied || "") ? 1 : -1; });
+      var g = el("div", { class: "stage-group" }, el("h2", { text: st[1] + " (" + group.length + ")" }));
+      group.forEach(function (j) { g.appendChild(appRow(j)); });
+      box.appendChild(g);
+    });
+  }
+
+  function appRow(j) {
+    var e = S.st[j.id] || {}, at = e.at || {}, s = e.s;
+    var appliedOn = at.applied, lastChange = at[s] || appliedOn;
+    var sel = el("select", { "aria-label": "Stage", on: { change: function () { setStatus(j, sel.value); } } },
+      STAGES.map(function (x) { var o = el("option", { value: x[0], text: x[1] }); if (x[0] === s) o.selected = true; return o; }));
+    var since = daysSince(lastChange);
+    var follow = (s === "applied" || s === "interview") && since !== null && since >= FOLLOW_UP_DAYS;
+    var note = el("textarea", { rows: 2, placeholder: "Notes: contact, interview dates, salary discussed…" });
+    note.value = e.note || "";
+    var t; note.addEventListener("input", function () { clearTimeout(t); t = setTimeout(function () { setNote(j, note.value.trim()); }, 600); });
+    note.addEventListener("blur", function () { setNote(j, note.value.trim()); });
+    var link = safeUrl(j.apply_url) || safeUrl(j.url);
+    return el("div", { class: "app" },
+      el("div", { class: "app-top" },
+        el("div", { class: "cm" }, el("h3", { text: j.title }),
+          el("div", { class: "meta", text: [j.company, appliedOn ? "applied " + appliedOn + " (" + ago(appliedOn) + ")" : ""].filter(Boolean).join(" · ") }),
+          follow ? el("div", { class: "followup", text: "No change for " + since + " days. Time to follow up?" }) : null,
+          j.open === false && s === "applied" ? el("div", { class: "followup", text: "The posting has closed." }) : null),
+        sel),
+      el("div", { class: "actions" },
+        link ? el("a", { class: "btn quiet", href: link, target: "_blank", rel: "noopener noreferrer", text: "Posting ↗" }) : null,
+        j.cv && j.cv.pdf ? el("a", { class: "btn quiet", href: repoFile(j.cv.pdf, false), target: "_blank", rel: "noopener", text: "CV sent" }) : null),
+      note);
+  }
+
+  function renderInsights() {
+    if (!P) return;
+    var box = $("insights"); box.textContent = "";
+    var run = lastRun();
+    if (run) {
+      var col = run.collected || {}, fl = run.filtered || {};
+      box.appendChild(el("div", { class: "box" }, el("h2", { text: "Last run · " + fmtTime(run.finished || run.started) }),
+        el("div", { class: "kpis" },
+          kpi((col.boards || 0) + (col.mcf || 0) + (col.linkedin || 0), "postings checked"),
+          kpi((run.triage || {}).in, "new to judge"),
+          kpi(run.scored, "read in full by AI"),
+          kpi(run.matches, "new matches"),
+          kpi(run.closed, "postings closed")),
+        el("p", { class: "muted small", style: "margin-top:10px", text:
+          "Sources: " + (col.boards || 0) + " from " + (run.boards_ok || 0) + "/" + (run.boards_total || 0) + " employer boards, " +
+          (col.mcf || 0) + " MyCareersFuture, " + (col.linkedin || 0) + " LinkedIn. Filtered out by rules: " + (fl.title || 0) + " by title, " +
+          (fl.location || 0) + " by location." + (run.deferred ? " " + run.deferred + " left for the next run (daily AI budget)." : "") }),
+        run.errors && run.errors.length ? el("p", { class: "err", text: run.errors.join("; ") }) : null));
+    }
+    var weeks = {}, mine = jobs().filter(isMatch);
+    mine.forEach(function (j) { var n = daysSince(j.found); if (n !== null && n < 56) { var w = Math.floor(n / 7); weeks[w] = (weeks[w] || 0) + 1; } });
+    var applied = apps().length, interviews = jobs().filter(function (j) { return ["interview", "offer"].indexOf(stOf(j)) >= 0; }).length;
+    box.appendChild(el("div", { class: "box" }, el("h2", { text: "Your pipeline" }),
+      el("div", { class: "kpis" }, kpi(weeks[0] || 0, "matches this week"), kpi(weeks[1] || 0, "last week"),
+        kpi(todo().length, "waiting for review"), kpi(applied, "applications"), kpi(interviews, "interviews / offers"))));
+
+    var qs = (P.queries || []).filter(function (q) { return q.source !== "board"; })
+      .sort(function (a, b) { return (b.matches - a.matches) || (b.avg_results - a.avg_results); });
+    if (qs.length) {
+      var t = el("table", null, el("thead", null, el("tr", null, el("th", { text: "Search" }), el("th", { text: "Where" }),
+        el("th", { class: "num", text: "Avg results" }), el("th", { class: "num", text: "Matches" }), el("th", { text: "" }))));
+      var tb = el("tbody");
+      qs.forEach(function (q) {
+        var tag = q.matches ? el("span", { class: "pill good", text: "useful" })
+          : q.zero_streak >= 3 ? el("span", { class: "pill stale", text: "stale" })
+          : q.runs >= 10 ? el("span", { class: "pill quiet", text: "no matches yet" }) : null;
+        tb.appendChild(el("tr", null, el("td", { class: "wrap", text: q.query }), el("td", { text: q.source === "mcf" ? "MyCareersFuture" : "LinkedIn" }),
+          el("td", { class: "num", text: q.avg_results }), el("td", { class: "num", text: q.matches }), el("td", null, tag)));
       });
-    });
-
-    var noteBtn = node.querySelector(".note-btn"), wrap = node.querySelector(".note-wrap"), ta = node.querySelector(".note");
-    var note = noteOf(j);
-    if (note) { ta.value = note; wrap.hidden = false; noteBtn.classList.add("has-note"); }
-    noteBtn.addEventListener("click", function () { wrap.hidden = !wrap.hidden; if (!wrap.hidden) ta.focus(); });
-    var timer = null;
-    function saveNote() { clearTimeout(timer); timer = null; if (ta.value.trim() !== noteOf(j)) setNote(j, ta.value.trim(), noteBtn); }
-    ta.addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(saveNote, 800); });
-    ta.addEventListener("blur", saveNote);
-    return node;
-  }
-
-  function setStatus(j, s) {
-    var prev = JSON.parse(JSON.stringify(D.site.statuses || {}));
-    D.site.statuses = D.site.statuses || {};
-    var entry = Object.assign({}, D.site.statuses[j.key] || {});
-    if (s) entry.status = s; else delete entry.status;
-    D.site.statuses[j.key] = entry;
-    renderJobs(); renderHeader();
-    var upd = {}; upd[j.key] = { status: s, title: j.title, company: j.company };
-    Src.save(upd).then(function (statuses) {
-      D.site.statuses = statuses;
-      delete errors.server; renderBanner();
-    }).catch(function (e) {
-      D.site.statuses = prev; renderJobs(); renderHeader();
-      errors.server = "Couldn't save: " + e.message; renderBanner();
-    });
-  }
-  function setNote(j, note, btn) {
-    var upd = {}; upd[j.key] = { note: note, title: j.title, company: j.company };
-    Src.save(upd).then(function (statuses) {
-      D.site.statuses = statuses;
-      btn.classList.toggle("has-note", !!note);
-    }).catch(function (e) { errors.server = "Couldn't save note: " + e.message; renderBanner(); });
-  }
-
-  // ---------- search health ----------
-  var H_COLS = [
-    ["query", "Query", false], ["history", "Recent runs", false], ["runs", "Runs", true], ["total_results", "Total results", true],
-    ["avg_results", "Avg / run", true], ["last_hit_date", "Last > 0", false], ["last_run_date", "Last run", false],
-    ["zero_streak", "Zero streak", true], ["status", "Status", false]
-  ];
-  function renderHealth() {
-    var t = $("healthTable");
-    t.textContent = "";
-    var Q = D.queries;
-    var rows = (Q && Q.summary) || [];
-    var stale = rows.filter(function (r) { return r.stale; }).length;
-    var never = rows.filter(function (r) { return r.never_hit; }).length;
-    $("healthSummary").textContent = rows.length ? rows.length + " queries · " + ((Q && Q.line_count) || 0) + " log lines · " +
-      stale + " stale · " + never + " never returned anything" + (Q && Q.skipped_lines ? " · " + Q.skipped_lines + " unreadable lines skipped" : "") : "";
-
-    var terms = ui.hq.toLowerCase();
-    var list = rows.filter(function (r) {
-      if (ui.staleOnly && !r.stale) return false;
-      return !terms || r.query.toLowerCase().indexOf(terms) >= 0;
-    });
-    var k = ui.hSort.key, dir = ui.hSort.dir;
-    list.sort(function (a, b) {
-      var x = a[k], y = b[k];
-      if (k === "status") { x = (a.stale ? 2 : 0) + (a.top10 ? 1 : 0); y = (b.stale ? 2 : 0) + (b.top10 ? 1 : 0); }
-      if (x == null) x = ""; if (y == null) y = "";
-      var c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y));
-      return c * dir || b.total_results - a.total_results;
-    });
-
-    var tr = el("tr");
-    H_COLS.forEach(function (c) {
-      var sortable = c[0] !== "history";
-      var th = el("th", { class: (c[2] ? "num " : "") + (sortable ? "sortable" : "") + (k === c[0] ? " sorted" : "") },
-        c[1] + (k === c[0] ? (dir < 0 ? " ↓" : " ↑") : ""));
-      if (sortable) th.addEventListener("click", function () {
-        if (ui.hSort.key === c[0]) ui.hSort.dir *= -1;
-        else ui.hSort = { key: c[0], dir: c[2] || c[0] === "status" || /date/.test(c[0]) ? -1 : 1 };
-        store("hSort", ui.hSort); renderHealth();
+      t.appendChild(tb);
+      box.appendChild(el("div", { class: "box" }, el("h2", { text: "Search phrases" }),
+        el("p", { text: "Stale = no results on the last 3 runs. Edit the list in config/search.json in the job-hunter repository." }),
+        el("details", null, el("summary", { text: "Show " + qs.length + " searches" }), el("div", { class: "tbl-wrap" }, t))));
+    }
+    var boards = (P.boards || []).slice().sort(function (a, b) { return b.jobs - a.jobs; });
+    if (boards.length) {
+      var bm = {}; (P.queries || []).forEach(function (q) { if (q.source === "board") bm[q.query] = q; });
+      var t2 = el("table", null, el("thead", null, el("tr", null, el("th", { text: "Employer" }), el("th", { class: "num", text: "Open jobs" }),
+        el("th", { class: "num", text: "Matches so far" }), el("th", { text: "" }))));
+      var tb2 = el("tbody");
+      boards.forEach(function (b) {
+        tb2.appendChild(el("tr", null, el("td", { text: b.company }), el("td", { class: "num", text: b.jobs }),
+          el("td", { class: "num", text: (bm[b.company] || {}).matches || 0 }),
+          el("td", null, b.status === 200 ? null : el("span", { class: "pill stale", text: "error " + b.status }))));
       });
-      tr.appendChild(th);
-    });
-    t.appendChild(el("thead", null, tr));
-    var tb = el("tbody");
-    if (!list.length) {
-      tb.appendChild(el("tr", null, el("td", { colspan: H_COLS.length, class: "zero", text: !Q ? "Loading…" : Q.error ? "No query log: " + Q.error : "No queries match." })));
+      t2.appendChild(tb2);
+      box.appendChild(el("div", { class: "box" }, el("h2", { text: "Employer job boards (" + boards.length + ")" }),
+        el("details", null, el("summary", { text: "Show boards" }), el("div", { class: "tbl-wrap" }, t2))));
     }
-    var maxN = 1;
-    rows.forEach(function (r) { (r.history || []).forEach(function (n) { if (n > maxN) maxN = n; }); });
-    list.forEach(function (r) {
-      var status = el("td");
-      if (r.stale) status.appendChild(el("span", { class: "badge rejected", title: "Zero results on the last " + r.zero_streak + " runs", text: "stale" }));
-      if (r.top10) status.appendChild(el("span", { class: "badge employer", text: "top 10" }));
-      if (r.never_hit) status.appendChild(el("span", { class: "badge", text: "never hit" }));
-      var spark = el("span", { class: "spark", title: "Last " + (r.history || []).length + " runs: " + (r.history || []).join(", ") });
-      (r.history || []).forEach(function (n) {
-        var h = Math.max(2, Math.round(n / maxN * 16));
-        spark.appendChild(el("i", { class: n ? "" : "z", style: "height:" + h + "px" }));
-      });
-      tb.appendChild(el("tr", { class: r.stale ? "stale" : "" },
-        el("td", { class: "wrap", text: r.query }),
-        el("td", null, spark),
-        el("td", { class: "num", text: r.runs }),
-        el("td", { class: "num" + (r.total_results ? "" : " zero"), text: r.total_results }),
-        el("td", { class: "num", text: r.avg_results }),
-        el("td", { class: r.last_hit_date ? "" : "zero", text: r.last_hit_date ? fmtDate(r.last_hit_date) : "never" }),
-        el("td", { class: r.in_latest_run ? "" : "zero", title: r.in_latest_run ? "" : "Not used in the latest run", text: fmtDate(r.last_run_date) }),
-        el("td", { class: "num" + (r.zero_streak >= 2 ? " bad" : r.zero_streak ? " warn" : ""), text: r.zero_streak }),
-        status));
-    });
-    t.appendChild(tb);
+    box.appendChild(el("div", { class: "box" }, el("h2", { text: "How this works" }),
+      el("p", { text: "Every morning a job on GitHub checks " + boards.length + " employer job boards, MyCareersFuture and LinkedIn. Simple rules drop obvious mismatches (engineering, marketing, wrong country). An AI then reads each remaining job and scores it against your CAREER_FACTS file and preferences. " + (P.min_score || 60) + "+ shows up for review." }),
+      el("p", { text: "The data is encrypted with your passphrase before it is published. Your shortlist, applications and notes stay in this browser on this device." })));
   }
+  function kpi(v, label) { return el("div", { class: "kpi" }, el("b", { text: v == null ? "–" : String(v) }), el("span", { text: label })); }
 
-  // ---------- runs ----------
-  function renderRuns() {
-    var t = $("runsTable");
-    t.textContent = "";
-    var R = D.runs;
-    var cols = ["Date", "New", "Scanned", "Dedup", "Expired / blocked", "Auto-rejected", "Non-job", "Below threshold", "ATS boards", "DDG"];
-    var tr = el("tr");
-    cols.forEach(function (c, i) { tr.appendChild(el("th", { class: i > 0 && i < 8 ? "num" : "", text: c })); });
-    t.appendChild(el("thead", null, tr));
-    var tb = el("tbody");
-    var runs = (R && R.runs) || [];
-    if (!runs.length) tb.appendChild(el("tr", null, el("td", { colspan: cols.length, class: "zero", text: !R ? "Loading…" : R.error ? "No run log: " + R.error : "No parsed runs yet." })));
-    runs.forEach(function (r) {
-      var b = r.boards || {}, d = r.ddg || {};
-      var boardsTxt = b.ok != null ? b.ok + " OK" + (b.failed ? ", " + b.failed + " failed" : "") : "—";
-      var boardsTitle = Object.keys(b).map(function (k) { return k + "=" + b[k]; }).join(", ");
-      var ddgTxt = d.queries != null ? d.queries + " q · " + dash(d.empty) + " empty" : "—";
-      var ddgWarn = d.queries && d.empty != null && d.empty / d.queries >= 0.5;
-      var det = r.details || {};
-      function detailFor(prefix) {
-        for (var k in det) if (k.indexOf(prefix) === 0) return det[k];
-        return null;
-      }
-      var row = el("tr", { class: "clickable", title: "Click to show the original line" },
-        el("td", { text: fmtDate(r.date) + (r.time ? " " + r.time : "") }),
-        el("td", { class: "num" + (r.new_matches ? " good" : " zero"), text: dash(r.new_matches) }),
-        el("td", { class: "num", title: detailFor("scanned"), text: dash(r.scanned) }),
-        el("td", { class: "num", text: dash(r.dedup) }),
-        el("td", { class: "num", title: detailFor("expired"), text: dash(r.expired_blocked) }),
-        el("td", { class: "num", text: dash(r.auto_rejected) }),
-        el("td", { class: "num", text: dash(r.nonjob) }),
-        el("td", { class: "num", title: r.near_misses || null, text: dash(r.below_threshold) + (r.near_misses ? " *" : "") }),
-        el("td", { class: b.failed ? "bad" : "", title: boardsTitle, text: boardsTxt }),
-        el("td", { class: ddgWarn ? "warn" : "", title: ddgWarn ? "Half or more of the DDG queries returned nothing" : null, text: ddgTxt }));
-      var extra = [];
-      if (r.near_misses) extra.push("Near misses: " + r.near_misses);
-      Object.keys(det).forEach(function (k) { if (k.indexOf("below") !== 0) extra.push(k + ": " + det[k]); });
-      var raw = el("tr", { class: "raw", hidden: "" }, el("td", { colspan: cols.length },
-        el("div", { text: r.raw }), extra.length ? el("div", { style: "margin-top:6px;color:var(--text)", text: extra.join("  ·  ") }) : null));
-      row.addEventListener("click", function () { raw.hidden = !raw.hidden; });
-      tb.appendChild(row); tb.appendChild(raw);
-    });
-    t.appendChild(tb);
-
-    var up = $("unparsed");
-    up.textContent = "";
-    var bad = (R && R.unparsed) || [];
-    if (bad.length) {
-      var box = el("div", { class: "unparsed" }, el("h3", { text: "Unparsed runs (" + bad.length + ")" }));
-      bad.forEach(function (u) { box.appendChild(el("pre", { text: "line " + u.line + ":  " + u.raw })); });
-      up.appendChild(box);
-    }
-    if (runs.some(function (r) { return r.near_misses; })) {
-      up.insertBefore(el("p", { class: "muted", style: "font-size:12px;margin:8px 2px 0", text: "* hover or click the row to see near-misses (scored just under the threshold; not in your job list)." }), up.firstChild);
-    }
-  }
-
-  // ---------- about ----------
-  function fmtSalary(s) {
-    if (s == null) return "—";
-    if (typeof s === "string" || typeof s === "number") return String(s);
-    if (Array.isArray(s)) return s.map(function (x) { return typeof x === "number" ? x.toLocaleString() : String(x); }).join(" – ");
-    if (typeof s === "object") {
-      var lo = s.min != null ? s.min : s.low, hi = s.max != null ? s.max : s.high;
-      if (lo != null || hi != null) {
-        return [s.currency || "", (lo != null ? Number(lo).toLocaleString() : "?") + " – " + (hi != null ? Number(hi).toLocaleString() : "?"),
-          s.period ? "/ " + s.period : ""].join(" ").trim();
-      }
-      return JSON.stringify(s);
-    }
-    return "—";
-  }
-  function fmtSize(n) { return n == null ? "" : n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : n > 1024 ? Math.round(n / 1024) + " KB" : n + " B"; }
-
-  function renderAbout() {
-    var a = $("about");
-    a.textContent = "";
-    var st = D.status || {}, cfg = st.config || {}, J = D.jobs || {};
-
-    var c = el("div", { class: "box" }, el("h3", { text: "Search config" }));
-    c.appendChild(el("dl", { class: "kv" },
-      el("dt", { text: "Min score" }), el("dd", { text: dash(cfg.min_score) }),
-      el("dt", { text: "Salary range" }), el("dd", { text: fmtSalary(cfg.salary_range) }),
-      el("dt", { text: "ATS watchlist" }), el("dd", { text: (cfg.watchlist || []).length + " companies" })));
-    var pills = el("div", { class: "pill-list", style: "margin-top:10px" });
-    (cfg.watchlist || []).forEach(function (w) { pills.appendChild(el("span", { class: "badge", title: w.ats || "", text: w.name })); });
-    c.appendChild(pills);
-    if (cfg.error) c.appendChild(el("p", { class: "muted", style: "margin-top:8px", text: "Config: " + cfg.error }));
-    a.appendChild(c);
-
-    var src = el("div", { class: "box" }, el("h3", { text: "Source badges" }),
-      el("p", null, el("span", { class: "badge employer", text: "employer-direct" }), " ATS pages (Lever, Greenhouse, Ashby, SmartRecruiters, Workday…) or the company's own careers site."),
-      el("p", null, el("span", { class: "badge linkedin", text: "LinkedIn" }), " a linkedin.com/jobs/view listing."),
-      el("p", null, el("span", { class: "badge aggregator", text: "aggregator" }), " job boards and everything else."),
-      el("p", { class: "muted", text: "From your config: " + (cfg.aggregator_domains || []).length + " aggregator domains, " +
-        (cfg.blocked_domains || []).length + " hard-blocked domains." }));
-    var srcCounts = {};
-    jobs().forEach(function (j) { srcCounts[j.source] = (srcCounts[j.source] || 0) + 1; });
-    src.appendChild(el("p", { class: "muted", text: "Your matches: " + Object.keys(srcCounts).map(function (k) { return srcCounts[k] + " " + (SOURCE_LABEL[k] || k); }).join(", ") }));
-    a.appendChild(src);
-
-    var f = el("div", { class: "box" }, el("h3", { text: "Data files (read-only)" }));
-    var kv = el("dl", { class: "kv" });
-    kv.appendChild(el("dt", { text: "Folder" })); kv.appendChild(el("dd", null, el("code", { text: dash(st.data_dir) })));
-    Object.keys(st.files || {}).forEach(function (k) {
-      var fi = st.files[k];
-      kv.appendChild(el("dt", { text: fi.name }));
-      kv.appendChild(el("dd", { class: fi.exists ? "" : "muted", text: fi.exists ? "updated " + fmtTime(fi.modified) + " · " + fmtSize(fi.size) : "missing" }));
-    });
-    f.appendChild(kv);
-    f.appendChild(el("p", { class: "muted", style: "margin-top:10px", text: "History: " + dash(J.history_count) + " records → " + dash(J.unique_count) +
-      " unique jobs" + (J.duplicates_merged ? " (" + J.duplicates_merged + " repeat URLs merged)" : "") + (J.invalid_records ? ", " + J.invalid_records + " unreadable" : "") + "." }));
-    a.appendChild(f);
-
-    var h = el("div", { class: "box" }, el("h3", { text: "How this works" }),
-      HOSTED
-        ? el("p", { text: "Your PC uploads an encrypted copy of the Hermes data after each cron run (it checks hourly). This page checks for a new upload every 5 minutes and whenever you come back to the tab. Last upload: " + fmtTime(D.publishedAt) + "." })
-        : el("p", { text: "The page re-reads your Hermes files every 5 minutes (and whenever you come back to the tab), so it always shows the latest cron run. Nothing is cached and nothing is sent to the internet." }),
-      el("p", { text: "“New” means the job appeared since your previous visit (a visit = opening the page after 30+ minutes away). Use “Mark all as seen” to clear the markers." }),
-      HOSTED
-        ? el("p", { text: "Your Interested / Applied / Reject choices and notes are saved in this browser only — they don't sync between your phone and computer, and clearing browser data erases them." })
-        : el("p", null, "Your Interested / Applied / Reject choices and notes are saved in ", el("code", { text: dash(st.state_file) }), " — the only file this site writes. Back it up if you care about your application history."),
-      el("p", { class: "muted", text: "Previous visit: " + fmtTime(D.site.prev_visit) + " · This visit: " + fmtTime(D.site.last_visit) }));
-    a.appendChild(h);
-  }
-
-  // ---------- tabs & controls ----------
+  // ---------- tabs & events ----------
   function showTab(name) {
-    if (!$("tab-" + name)) name = "jobs";
+    if (!$("tab-" + name)) name = "review";
     ui.tab = name; store("tab", name);
-    document.querySelectorAll(".tab").forEach(function (b) {
-      var on = b.getAttribute("data-tab") === name;
-      b.classList.toggle("active", on); b.setAttribute("aria-selected", on);
-    });
+    document.querySelectorAll(".tab").forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-tab") === name); });
     document.querySelectorAll(".panel").forEach(function (p) { p.hidden = p.id !== "tab-" + name; });
-    if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
   }
 
   function init() {
-    ui.tab = (location.hash || "").slice(1) || recall("tab", "jobs");
-    ui.sort = recall("sort", "date");
-    ui.chip = recall("chip", "all");
-    ui.hSort = recall("hSort", ui.hSort);
-    $("sort").value = ui.sort;
-
-    document.querySelectorAll(".tab").forEach(function (b) {
-      b.addEventListener("click", function () { showTab(b.getAttribute("data-tab")); });
+    document.querySelectorAll(".tab").forEach(function (b) { b.addEventListener("click", function () { showTab(b.getAttribute("data-tab")); window.scrollTo(0, 0); }); });
+    document.querySelectorAll(".seg button").forEach(function (b) {
+      b.addEventListener("click", function () { ui.view = b.getAttribute("data-view"); store("view", ui.view); renderReview(); });
     });
-    showTab(ui.tab);
-
-    var qTimer;
-    $("q").addEventListener("input", function (e) { clearTimeout(qTimer); qTimer = setTimeout(function () { ui.q = e.target.value; renderJobs(); }, 120); });
-    $("minScore").addEventListener("input", function (e) { ui.minScore = +e.target.value; $("minScoreVal").textContent = ui.minScore; renderJobs(); });
-    $("company").addEventListener("change", function (e) { ui.company = e.target.value; renderJobs(); });
-    $("location").addEventListener("change", function (e) { ui.location = e.target.value; renderJobs(); });
-    $("source").addEventListener("change", function (e) { ui.source = e.target.value; renderJobs(); });
-    $("sort").addEventListener("change", function (e) { ui.sort = e.target.value; store("sort", ui.sort); renderJobs(); });
-    $("hq").addEventListener("input", function (e) { ui.hq = e.target.value; renderHealth(); });
-    $("staleOnly").addEventListener("change", function (e) { ui.staleOnly = e.target.checked; renderHealth(); });
-    $("refreshBtn").addEventListener("click", function () { $("updated").textContent = "Refreshing…"; loadAll(true); });
-    $("markSeen").addEventListener("click", function () {
-      Src.visit(true).then(function (s) { if (s && !s.error) { D.site = s; renderJobs(); renderHeader(); renderAbout(); } });
+    var qt; $("q").addEventListener("input", function (e) { clearTimeout(qt); qt = setTimeout(function () { ui.q = e.target.value; renderReview(); }, 150); });
+    [["fOpen", "fOpen"], ["fNear", "fNear"], ["fOld", "fOld"], ["fSkipped", "fSkipped"]].forEach(function (x) {
+      $(x[0]).addEventListener("change", function (e) { ui[x[1]] = e.target.checked; renderReview(); });
     });
-    if (HOSTED) {
-      $("lockBtn").hidden = false;
-      $("lockBtn").addEventListener("click", function () { forgetKey(); D = { jobs: null, queries: null, runs: null, status: null, site: {} }; showLock(""); });
-      $("lockForm").addEventListener("submit", function (e) {
-        e.preventDefault();
-        var btn = $("unlockBtn");
-        btn.disabled = true; btn.textContent = "Unlocking…"; $("lockErr").textContent = "";
-        Hosted.unlock($("pass").value, $("remember").checked).then(function () {
-          return loadAll(true);
-        }).catch(function (err) {
-          $("lockErr").textContent = err.message || "Couldn't unlock.";
-        }).then(function () { btn.disabled = false; btn.textContent = "Unlock"; });
-      });
-    }
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
-        e.preventDefault(); showTab("jobs"); $("q").focus();
-      }
+    $("refreshBtn").addEventListener("click", function () { $("status").textContent = "Checking…"; refresh(false); });
+    $("lockBtn").addEventListener("click", function () { forgetKey(); P = null; showLock(""); });
+    $("lockForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var btn = $("unlockBtn"); btn.disabled = true; btn.textContent = "Unlocking…"; $("lockErr").textContent = "";
+      unlock($("pass").value, $("remember").checked).then(function () { return refresh(true); })
+        .catch(function (err) { $("lockErr").textContent = err.message || "Couldn't unlock."; })
+        .then(function () { btn.disabled = false; btn.textContent = "Unlock"; });
     });
     document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
     setInterval(poll, POLL_MS);
-    loadAll(true);
+    showTab(ui.tab);
+    refresh(true);
   }
-
   init();
 })();
