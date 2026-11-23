@@ -240,7 +240,8 @@
     renderHeader(); renderReview(); renderApps(); renderInsights(); showTab(ui.tab);
   }
 
-  function lastRun() { var r = (P && P.runs) || []; return r.length ? r[r.length - 1] : null; }
+  function lastRun() { var r = ((P && P.runs) || []).filter(function (x) { return x.collected; }); return r.length ? r[r.length - 1] : null; }
+  function lastJudging() { var r = ((P && P.runs) || []).filter(function (x) { return x.type === "claude"; }); return r.length ? r[r.length - 1] : null; }
 
   function renderHeader() {
     var nNew = P ? todo().filter(isNew).length : 0;
@@ -423,15 +424,15 @@
   function renderInsights() {
     if (!P) return;
     var box = $("insights"); box.textContent = "";
-    var run = lastRun();
+    var run = lastRun(), jr = lastJudging();
     if (run) {
       var col = run.collected || {}, fl = run.filtered || {};
       box.appendChild(el("div", { class: "box" }, el("h2", { text: "Last run · " + fmtTime(run.finished || run.started) }),
         el("div", { class: "kpis" },
           kpi((col.boards || 0) + (col.mcf || 0) + (col.linkedin || 0) + (col.telegram || 0), "postings checked"),
-          kpi((run.triage || {}).in, "new to judge"),
-          kpi(run.scored, "read in full by AI"),
-          kpi(run.matches, "new matches"),
+          kpi((run.queued || {}).added != null ? run.queued.added : (run.triage || {}).in, "new to judge"),
+          kpi(jr ? jr.judged : run.scored, jr ? "judged by Claude" : "read in full by AI"),
+          kpi(jr ? jr.matches : run.matches, "new matches"),
           kpi(run.closed, "postings closed")),
         el("p", { class: "muted small", style: "margin-top:10px", text:
           "Sources: " + (col.boards || 0) + " from " + (run.boards_ok || 0) + "/" + (run.boards_total || 0) + " employer boards, " +
@@ -480,7 +481,7 @@
         el("details", null, el("summary", { text: "Show boards" }), el("div", { class: "tbl-wrap" }, t2))));
     }
     box.appendChild(el("div", { class: "box" }, el("h2", { text: "How this works" }),
-      el("p", { text: "Every morning a job on GitHub checks " + boards.length + " employer job boards, MyCareersFuture, LinkedIn and the Talent@Web3 Telegram channel. Simple rules drop obvious mismatches (engineering, marketing, wrong country). An AI then reads each remaining job and scores it against your CAREER_FACTS file and preferences. " + (P.min_score || 60) + "+ shows up for review." }),
+      el("p", { text: "Every morning a job on GitHub checks " + boards.length + " employer job boards, MyCareersFuture, LinkedIn and the Talent@Web3 Telegram channel. Simple rules drop obvious mismatches (engineering, marketing, wrong country). Then a scheduled Claude session (on your Claude subscription) reads each remaining job, scores it against your CAREER_FACTS file and preferences, and writes tailored CVs for the strongest matches. " + (P.min_score || 60) + "+ shows up for review." }),
       el("p", { text: "The data is encrypted with your passphrase before it is published. Your shortlist, applications and notes stay in this browser on this device." })));
   }
   function kpi(v, label) { return el("div", { class: "kpi" }, el("b", { text: v == null ? "–" : String(v) }), el("span", { text: label })); }
